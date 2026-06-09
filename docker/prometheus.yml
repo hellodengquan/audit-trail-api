@@ -1,0 +1,35 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: audit-trail-local
+    environment: docker-compose
+
+rule_files:
+  # - "rules/*.yml"
+
+alerting:
+  # alertmanagers:
+  #   - static_configs:
+  #       - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 审计日志服务（/metrics 由 prometheus-fastapi-instrumentator 暴露）
+  - job_name: "audit-trail-api"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["audit-trail-api:8000"]
+        labels:
+          app: "audit-trail"
+          service: "api"
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # 可选：容器自身监控（若部署 cadvisor 可扩展）
+  # - job_name: "cadvisor"
+  #   static_configs:
+  #     - targets: ["cadvisor:8080"]

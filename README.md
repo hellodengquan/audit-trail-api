@@ -2,6 +2,13 @@
 
 基于 **FastAPI + SQLAlchemy + JWT** 构建的企业级审计日志服务，提供事件记录、操作者/资源查询、敏感操作追踪、统计分析、数据导出等能力。
 
+> **当前版本**：[**0.4.0**](./CHANGELOG.md) | [📜 CHANGELOG](./CHANGELOG.md) | [🐳 Docker 快速启动](#docker-快速启动)
+>
+> - **0.4.0**（2026-06-10）：速率限制 + 审计不可篡改触发器 + Docker/K8s 生产镜像
+> - **0.3.0**（2026-06-09）：Prometheus 可观测 + 统计聚合 + 数据导出
+> - **0.2.0**（2026-06-08）：JWT 登录 + RBAC + 敏感事件分级引擎
+> - **0.1.0**（2026-06-07）：MVP — 审计事件 CRUD + 多维度查询
+
 ---
 
 ## 目录
@@ -9,7 +16,8 @@
 - [功能特性](#功能特性)
 - [技术栈](#技术栈)
 - [项目结构](#项目结构)
-- [快速启动](#快速启动)
+- [Docker 快速启动](#docker-快速启动) ⭐（推荐生产/演示首选）
+- [快速启动](#快速启动)（本地 Python 开发）
 - [ER 关系图](#er-关系图)
 - [API 概览](#api-概览)
 - [敏感规则配置](#敏感规则配置)
@@ -17,6 +25,7 @@
 - [测试](#测试)
 - [部署与运维](#部署与运维)
 - [常见问题](#常见问题)
+- [CHANGELOG](./CHANGELOG.md)
 
 ---
 
@@ -81,6 +90,156 @@
 ├── main.py                 # uvicorn 启动入口
 └── audit_trail.db          # SQLite (自动生成)
 ```
+
+---
+
+## Docker 快速启动
+
+> 无需安装 Python 环境，一条命令拉起 **Audit API + Prometheus**，自带数据卷持久化。
+> 适用场景：本地演示、CI 环境、K8s 不可变镜像基准。
+
+### 前置要求
+
+- Docker ≥ 24
+- Docker Compose v2（`docker compose` 插件）
+
+### 1. 一键启动
+
+```bash
+# 在项目根目录下
+docker compose up -d --build
+```
+
+首次会：
+1. 基于 `Dockerfile` 构建 `audit-trail-api:0.4.0`（多阶段构建，镜像 ≈ 250MB）
+2. 启动 `prometheus:v2.53.2`（已预配置 scrape 到 audit-trail-api:8000/metrics）
+3. 自动执行 `alembic upgrade head`（创建表 + 防篡改触发器）
+4. 首次启动自动创建默认管理员 `admin / admin123`（请生产覆盖 `ADMIN_PASSWORD`）
+
+### 2. 验证服务
+
+| 访问点 | URL | 说明 |
+|--------|-----|------|
+| **OpenAPI / Swagger** | http://localhost:8000/docs | 在线调试 API |
+| **ReDoc** | http://localhost:8000/redoc | 离线友好文档 |
+| **健康检查** | http://localhost:8000/health | `{"status":"ok"}` |
+| **Prometheus 指标** | http://localhost:8000/metrics | Prometheus 采集端点 |
+| **Prometheus UI** | http://localhost:9090 | 查询指标 / 画面板 |
+| **登录获取 token** | `POST http://localhost:8000/api/v1/login` | body: `{"username":"admin","password":"admin123"}` |
+
+常用 curl 冒烟：
+
+```bash
+# 登录
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"admin123"}' \
+  | jq -r '.access_token')
+
+# 写入一条审计事件
+curl -s -X POST http://localhost:8000/api/v1/events \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"actor_id":"alice","actor_name":"Alice","action":"login",
+       "resource_type":"web","resource_id":"/home","status":"success"}' \
+  | jq
+
+# 触发 429（临时调小阈值的演示，或连发 60+ 条）
+for i in $(seq 1 62); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/api/v1/events \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"actor_id\":\"bob\",\"action\":\"read\",\"resource_type\":\"doc\",\"resource_id\":\"$i\"}"
+done | sort | uniq -c
+# 预期：60 × 201 + 2 × 429
+```
+
+### 3. 常用命令
+
+```bash
+# 查看日志
+docker compose logs -f audit-trail-api
+docker compose logs -f prometheus
+
+# 进入 API 容器执行操作
+docker compose exec audit-trail-api sh
+
+# 检查 Alembic 迁移状态
+docker compose exec audit-trail-api alembic current
+docker compose exec audit-trail-api alembic history -v
+
+# 运行测试（容器内）
+docker compose exec audit-trail-api python -m pytest tests/test_rate_limit_and_immutable.py -v
+
+# 停止但保留数据
+docker compose stop
+
+# 停止并删除容器（数据卷仍保留）
+docker compose down
+
+# 完全清理（⚠️ 删除 SQLite + Prometheus 数据）
+docker compose down -v
+```
+
+### 4. 数据卷与持久化
+
+| Volume | 挂载点 | 用途 | 清理方式 |
+|--------|--------|------|----------|
+| `audit-trail-data` | `/data/audit_trail.db` | SQLite 审计数据 | `docker volume rm audit-trail-data` |
+| `audit-prometheus-data` | `/prometheus` | Prometheus TSDB（30 天） | `docker volume rm audit-prometheus-data` |
+
+> **生产建议**：Kubernetes 部署时把 `/data` 对应 `PersistentVolumeClaim` (RWO)；SQLite 不是分布式数据库，若写 > 200 TPS 或需多副本，请切 PostgreSQL（见 FAQ）。
+
+### 5. 自定义配置
+
+docker-compose 中的 `environment` 段落是最常用的覆盖方式：
+
+```yaml
+audit-trail-api:
+  environment:
+    - SECRET_KEY=<openssl rand -hex 32 的输出>  # ⚠️ 生产必改
+    - ADMIN_PASSWORD=<强密码>                    # ⚠️ 生产必改
+    - RATE_LIMIT_EVENTS_PER_MINUTE_IP=300        # 高流量场景放大
+    - RATE_LIMIT_EVENTS_PER_MINUTE_ACTOR=120
+    - WORKERS=4                                  # 建议 = CPU 核数 × 1~2
+    - CORS_ORIGINS=["https://app.company.com"]
+```
+
+也可使用 `.env`（参考 `.env.example`），在 compose 中加 `env_file: .env`。
+
+### 6. 构建可复用的不可变镜像（Kubernetes 用）
+
+```bash
+# 打版本标签
+export VERSION=0.4.0
+docker build \
+  --build-arg APP_VERSION=$VERSION \
+  --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+  -t registry.company.com/audit/audit-trail-api:$VERSION \
+  -f Dockerfile .
+
+docker push registry.company.com/audit/audit-trail-api:$VERSION
+```
+
+> 镜像以 digest 方式引用可确保 **不可变部署**：
+> ```bash
+> docker inspect --format='{{index .RepoDigests 0}}' registry.company.com/audit/audit-trail-api:$VERSION
+> # k8s Deployment: image: registry.company.com/audit/audit-trail-api@sha256:xxx
+> ```
+
+### 7. 镜像安全特性（符合生产基线）
+
+| 项 | 说明 |
+|----|------|
+| 多阶段构建 | builder 只装编译工具，runtime 镜像不含 gcc/make |
+| 非 root 运行 | `USER app`（uid 10001，无 shell 登录权限） |
+| 1 号进程管理 | `tini`，避免 uvicorn 产生僵尸进程 |
+| HEALTHCHECK | 30s 探活，启动容差 15s |
+| OCI 标签 | `org.opencontainers.image.*` 元数据（版本、构建时间） |
+| Compose 资源限制 | `mem_limit: 512m`, `cpus: "1.0"`, `pids_limit: 256` |
+| `no-new-privileges` | 禁止容器内进程升权 |
+
+更多生产加固（速率限制、触发器、Prometheus、告警规则）见 [§11 生产加固：速率限制 + 审计不可篡改](#生产加固速率限制--审计不可篡改)。
 
 ---
 
