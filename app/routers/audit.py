@@ -11,15 +11,17 @@ from app.schemas import (
     AuditEventQueryParams
 )
 from app import crud
+from app.rate_limiter import enforce_events_rate_limit
 
 router = APIRouter(prefix="/events", tags=["Audit Events"])
 
 
 @router.post("", response_model=AuditEventResponse, status_code=status.HTTP_201_CREATED)
-def create_event(
+async def create_event(
     event_data: AuditEventCreate,
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(enforce_events_rate_limit),
 ):
     if event_data.actor_ip is None:
         event_data.actor_ip = get_client_ip(request)
@@ -31,10 +33,11 @@ def create_event(
 
 
 @router.post("/bulk", status_code=status.HTTP_201_CREATED)
-def create_events_bulk(
+async def create_events_bulk(
     events_data: List[AuditEventCreate],
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(enforce_events_rate_limit),
 ):
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("User-Agent")

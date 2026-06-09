@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     PAGE_SIZE_DEFAULT: int = 20
     PAGE_SIZE_MAX: int = 100
 
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_EVENTS_PER_MINUTE_IP: int = 60
+    RATE_LIMIT_EVENTS_PER_MINUTE_ACTOR: int = 60
+    RATE_LIMIT_BULK_FACTOR: int = 10
+
+    AUDIT_IMMUTABLE: bool = True
+
     class Config:
         env_file = ".env"
         case_sensitive = True

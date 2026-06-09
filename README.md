@@ -820,6 +820,171 @@ scrape_configs:
 
 ---
 
+## 生产加固：速率限制 + 审计不可篡改
+
+### 11.1 写入速率限制（Rate Limiting）
+
+为防止恶意 / 异常客户端快速填充磁盘，`POST /events` 与 `POST /events/bulk` 已接入基于 **IP + actor_id 双维度** 的速率限制，默认阈值为 **每分钟 60 条**。
+
+#### 11.1.1 机制说明
+
+| 维度 | 触发条件 | 超额响应 |
+|------|----------|----------|
+| IP (`X-Forwarded-For` / `X-Real-IP` / 远端 IP) | 同一 IP 在 60s 窗口中写入事件数（批量按长度计）超过阈值 | `429 Too Many Requests` + 详细 JSON 错误体 |
+| actor_id (请求体 JSON) | 同一 `actor_id` 在 60s 窗口中写入事件数超过阈值 | `429 Too Many Requests`，`detail.scope == "actor_id"` |
+
+- 两条检查**分别独立**，任一超额立即 429
+- `POST /events/bulk` 一次写入 N 条，消耗额度 = `min(N, 1000)`（取批量长度）
+- 存储使用**内存固定窗口**（FastAPI 多 worker 场景建议切到 Redis 实现，见下文）
+- 不影响查询接口（`GET /events*`, `/statistics`, `/export*`）
+
+#### 11.1.2 配置项（环境变量）
+
+```bash
+# 是否启用速率限制（默认 true）
+RATE_LIMIT_ENABLED=true
+
+# 单 IP 每分钟可写入的事件数（默认 60）
+RATE_LIMIT_EVENTS_PER_MINUTE_IP=60
+
+# 单 actor_id 每分钟可写入的事件数（默认 60）
+RATE_LIMIT_EVENTS_PER_MINUTE_ACTOR=60
+
+# bulk 写入放大系数（预留，当前默认按 list 长度计）
+RATE_LIMIT_BULK_FACTOR=10
+```
+
+#### 11.1.3 429 响应示例
+
+```json
+// HTTP 429
+{
+  "error": {
+    "code": 429,
+    "message": {
+      "message": "Too many requests for this IP",
+      "type": "rate_limit",
+      "scope": "ip",
+      "limit": 60,
+      "window_seconds": 60
+    },
+    "type": "http_error"
+  }
+}
+```
+
+#### 11.1.4 多 worker / Kubernetes 部署
+
+当前默认实现是 `MemoryStorage`，仅在同一进程内有效。若使用 `uvicorn --workers N` 或多副本部署，需切到 Redis：
+
+```bash
+pip install limits[redis]
+```
+
+```python
+# app/rate_limiter.py 替换 _storage & _window
+from limits.storage import RedisStorage
+from limits.strategies import MovingWindowRateLimiter
+
+REDIS_URL = os.environ.get("RATE_LIMIT_REDIS_URL", "redis://localhost:6379/1")
+_storage = RedisStorage(REDIS_URL)
+_window = MovingWindowRateLimiter(storage=_storage)
+```
+
+---
+
+### 11.2 审计日志不可篡改（Immutable via Triggers）
+
+在文档承诺「不可篡改」的基础上，新增数据库层触发器硬约束：**audit_events 表的 UPDATE / DELETE 直接由数据库抛出错误**，即便 admin token 被盗或管理员误操作也无法修改历史数据。
+
+#### 11.2.1 迁移脚本
+
+已在 `migrations/versions/ad13ecb4406d_*.py` 中实现 3 种方言：
+
+| 数据库 | 实现方式 | 版本支持 |
+|--------|----------|----------|
+| **SQLite** | `CREATE TRIGGER … BEFORE UPDATE/DELETE … RAISE(ABORT, '… immutable')` | SQLite 3.x |
+| **PostgreSQL** | `plpgsql` 函数 `audit_events_immutable()` + 2 个触发器 | PG 11+ |
+| **MySQL / MariaDB** | `BEFORE UPDATE/DELETE … SIGNAL SQLSTATE '45000'` | MySQL 5.7+ / MariaDB 10.2+ |
+
+升级命令：
+
+```bash
+# 生产环境执行：从旧版本升级
+alembic upgrade head
+# 或只执行本次触发器迁移
+alembic upgrade ad13ecb4406d
+```
+
+降级（仅用于运维操作，不建议长期关闭）：
+
+```bash
+# 回滚触发器，允许临时清理
+alembic downgrade -1
+```
+
+#### 11.2.2 行为验证
+
+```sql
+-- 1. 尝试 UPDATE（管理员直连数据库）
+UPDATE audit_events SET is_sensitive = 0 WHERE id = 1;
+-- SQLite  报错: [SQLITE_CONSTRAINT_TRIGGER] abort at 22 in ... UPDATE on audit_events is forbidden - table is immutable
+-- PG      报错: ERROR:  UPDATE on audit_events is forbidden - table is immutable
+-- MySQL   报错: Error Code: 1644. UPDATE on audit_events is forbidden ...
+
+-- 2. 尝试 DELETE
+DELETE FROM audit_events WHERE id = 1;
+-- 同上，被 BEFORE DELETE 触发器拦截
+```
+
+#### 11.2.3 运维场景处理
+
+| 场景 | 推荐做法 |
+|------|----------|
+| 合规数据清理（保留 N 天） | 先 `alembic downgrade -1` 关触发器，按时间段 DELETE，然后 `alembic upgrade head` 重新建触发器；全程记录操作日志 |
+| 数据订正（极个别事件修正） | 不修改旧行，**追加**一条互补事件 `action="correct"`，`old_value`/`new_value` 写明原因 |
+| 全量重建 / 迁移 | 走 `pg_dump`/`mysqldump` 逻辑导出，触发器在新库自动通过 alembic 重建 |
+| 需要对 audit_events 建分区 | 通过新迁移 DDL 完成，**不要直接 DROP/TRUNCATE**，若需要请先关触发器 |
+
+#### 11.2.4 纵深防御建议
+
+触发器属于硬兜底，建议同时配置以下多重防线：
+
+1. **数据库账号最小化**：生产环境专用 DB 用户仅授予 `INSERT, SELECT`，不要 `UPDATE/DELETE/ALTER/DROP`
+2. **WAL / Binlog 归档**：PostgreSQL `archive_mode=on`，MySQL binlog 过期 ≥ 180 天
+3. **事件哈希链**：可选扩展 `audit_events` 加 `prev_hash` 字段，形成 SHA-256 链，破坏者无法重算后续所有哈希
+4. **旁路写入对象存储**：每 5 分钟以 append-only 方式把 JSON 行写入 S3 / OSS，设置 WORM 策略
+5. **定时校验**：通过每日离线任务比对 DB 条数、敏感事件总数与哈希链完整性，发现差异立即告警
+
+---
+
+### 11.3 触发告警推荐
+
+结合 Prometheus 指标 + 429 响应做 SLO 告警：
+
+```yaml
+# 1. 写入被频繁限流（可能是攻击或 bug）
+- alert: AuditWriteRateLimitExceeded
+  expr: sum by (scope) (rate(http_requests_total{endpoint!~"/health|/metrics",status_code="429"}[5m])) > 1
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Audit API 限流了 {{ $value | printf \"%.2f\" }} req/s"
+    scope: "{{ $labels.scope }}"
+
+# 2. 检测到尝试 UPDATE/DELETE（DB error 会在应用层返回 500）
+- alert: AuditImmutableViolationAttempt
+  expr: increase(http_requests_total{status_code="500",endpoint=~".*events.*"}[1h]) > 0
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: "审计表疑似存在篡改尝试，请立即核查 application log"
+```
+
+---
+
 ## License
 
 内部项目，按需使用。
