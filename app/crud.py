@@ -10,6 +10,7 @@ from app.schemas import (
     AuditEventCreate, AuditEventQueryParams,
     SensitiveRuleCreate, SensitiveRuleUpdate, AggregationQueryParams
 )
+from app import metrics
 
 
 def _match_pattern(text: Optional[str], pattern: Optional[str]) -> bool:
@@ -101,6 +102,20 @@ def create_audit_event(db: Session, event_data: AuditEventCreate) -> AuditEvent:
     db.add(db_event)
     db.commit()
     db.refresh(db_event)
+
+    try:
+        metrics.record_event_ingested(
+            action=db_event.action.value,
+            status=db_event.status.value,
+            service_name=db_event.service_name,
+            is_sensitive=db_event.is_sensitive,
+            severity=db_event.severity.value,
+            matched_rule_id=db_event.matched_rule_id,
+            actor_id=db_event.actor_id,
+        )
+    except Exception:
+        pass
+
     return db_event
 
 
@@ -136,6 +151,21 @@ def create_audit_events_bulk(db: Session, events_data: List[AuditEventCreate]) -
 
     db.bulk_save_objects(db_events)
     db.commit()
+
+    try:
+        for db_event in db_events:
+            metrics.record_event_ingested(
+                action=db_event.action.value,
+                status=db_event.status.value,
+                service_name=db_event.service_name,
+                is_sensitive=db_event.is_sensitive,
+                severity=db_event.severity.value,
+                matched_rule_id=db_event.matched_rule_id,
+                actor_id=db_event.actor_id,
+            )
+    except Exception:
+        pass
+
     return db_events
 
 

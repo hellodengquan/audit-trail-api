@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from contextlib import asynccontextmanager
+from prometheus_fastapi_instrumentator import Instrumentator, metrics
 
 from app.config import settings
 from app.database import engine, Base, SessionLocal
@@ -12,6 +14,7 @@ from app.routers import auth, audit, admin, export
 from app import crud
 from app.schemas import SensitiveRuleCreate
 from app.models import SeverityLevel
+from app import metrics as audit_metrics
 
 
 def init_database():
@@ -20,6 +23,10 @@ def init_database():
     try:
         create_default_admin_user(db)
         _init_default_sensitive_rules(db)
+        try:
+            audit_metrics.bootstrap_actor_count_from_db(db)
+        except Exception:
+            pass
     finally:
         db.close()
 
@@ -126,6 +133,13 @@ def create_app() -> FastAPI:
             "version": settings.APP_VERSION,
         }
 
+    @app.get("/metrics", tags=["Observability"])
+    async def prometheus_metrics():
+        return PlainTextResponse(
+            audit_metrics.generate_metrics(),
+            media_type=audit_metrics.get_metrics_content_type(),
+        )
+
     @app.get("/", tags=["Root"])
     async def root():
         return {
@@ -134,8 +148,20 @@ def create_app() -> FastAPI:
             "docs": "/docs",
             "redoc": "/redoc",
             "health": "/health",
+            "metrics": "/metrics",
             "api_prefix": settings.API_V1_PREFIX,
         }
+
+    Instrumentator(
+        should_group_status_codes=False,
+        excluded_handlers=["/metrics", "/health", "/openapi.json", "/docs", "/redoc"],
+        body_handlers=[],
+    ).add(
+        metrics.request_size(),
+        metrics.response_size(),
+        metrics.latency(),
+        metrics.requests(),
+    ).instrument(app)
 
     return app
 

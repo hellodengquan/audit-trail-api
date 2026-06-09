@@ -598,6 +598,228 @@ A: 推荐：
 
 ---
 
+## Production Hardening
+
+本章节面向生产部署场景，涵盖 **Schema 迁移流程** 和 **可观测性指标体系** 两部分核心治理能力。
+
+### 10.1 数据库 Schema 迁移（Alembic）
+
+本项目已接入 **Alembic** 作为官方迁移工具，**取代此前 `drop+create` 的破坏性方式**，确保历史数据在字段演进中完整保留。
+
+#### 10.1.1 迁移相关文件
+
+```
+19-audit-trail-api/
+├── alembic.ini              # Alembic 主配置
+└── migrations/
+    ├── env.py               # 迁移环境（已绑定 SQLAlchemy Base.metadata）
+    ├── script.py.mako       # 迁移脚本模板
+    └── versions/
+        └── d73d9e05e6c7_initial_tables_users_audit_events_.py   # 初始 revision
+```
+
+#### 10.1.2 完整迁移工作流
+
+```bash
+# =========================================================
+# Step 0: 第一次部署（从空库初始化）
+# =========================================================
+# 直接迁移到最新版本
+alembic upgrade head
+
+# 验证迁移版本
+alembic current
+# 预期输出: d73d9e05e6c7 (head)
+
+# =========================================================
+# Step 1: 修改模型（例如给 AuditEvent 加 tenant_id 字段）
+# =========================================================
+# 编辑 app/models.py，在 AuditEvent 中新增：
+#   tenant_id = Column(String(50), index=True)
+
+# =========================================================
+# Step 2: 自动生成迁移脚本（推荐 review 后再提交）
+# =========================================================
+alembic revision --autogenerate -m "add_tenant_id_to_audit_events"
+# → 生成 migrations/versions/<hash>_add_tenant_id_to_audit_events.py
+# ⚠️ 务必打开文件 review：
+#    - 字段顺序、类型、nullable 是否正确
+#    - 索引/约束是否遗漏
+#    - 枚举变更是否需要数据迁移脚本
+
+# =========================================================
+# Step 3: 预演升级（SQL 预览）
+# =========================================================
+alembic upgrade head --sql > migration.sql
+# 对 SQL 文件做代码评审，特别注意：
+#   - 大表 ALTER TABLE 是否需要先加索引再改字段
+#   - 枚举类型变更（PostgreSQL 需先 CREATE TYPE ... AS ENUM）
+
+# =========================================================
+# Step 4: 生产升级
+# =========================================================
+# 推荐在低峰期执行；PostgreSQL 上 DDL 会短暂锁表
+alembic upgrade head
+
+# 验证
+alembic current
+psql audit_trail -c "SELECT * FROM alembic_version;"
+
+# =========================================================
+# 常用其他命令
+# =========================================================
+alembic history -v            # 查看迁移历史
+alembic downgrade -1         # 回滚 1 个版本
+alembic stamp head           # 标记为最新版本（跳过执行，仅用于人工同步后的修复）
+alembic merge heads          # 多分支合并
+```
+
+#### 10.1.3 环境变量配置
+
+```bash
+# 默认使用 alembic.ini 的 sqlalchemy.url；生产建议覆盖：
+export DATABASE_URL="postgresql://audit_user:StrongPass@db.example.com:5432/audit_trail"
+
+# 或用 Docker 传参：
+docker run -e DATABASE_URL=... audit-trail alembic upgrade head
+```
+
+#### 10.1.4 迁移检查清单（生产执行前必须确认）
+
+- [ ] `--sql` 预览文件已评审
+- [ ] 已在 staging 环境 1:1 还原生产数据演练过
+- [ ] 大表 DDL 已评估执行时长与锁表影响
+- [ ] 回滚脚本 `downgrade -1` 也已在 staging 演练
+- [ ] 迁移执行时间选在业务低峰期
+
+---
+
+### 10.2 可观测性指标（Prometheus）
+
+项目接入了 **prometheus-fastapi-instrumentator**，并内置 3 类指标共 **8+ 条时间序列**，运维可通过 `/metrics` 抓取。
+
+#### 10.2.1 快速验证
+
+```bash
+# 启动服务后
+curl -s http://localhost:8000/metrics | grep -E "^audit_|^http_"
+
+# 产出示例：
+# audit_events_ingested_total{action="create",service_name="user-service",status="success"} 127
+# audit_sensitive_hits_total{matched_rule_id="1",severity="high"} 23
+# audit_distinct_actor_count 58
+# http_request_duration_seconds_sum{endpoint="/api/v1/events",method="POST",status_code="201"} 0.412
+# http_requests_total{endpoint="/api/v1/events",method="POST",status_code="201"} 127
+```
+
+#### 10.2.2 指标总览
+
+| 指标名 | 类型 | labels | 含义 | 典型用途 |
+|--------|------|--------|------|----------|
+| `audit_events_ingested_total` | **Counter** | `action` / `status` / `service_name` | 累计写入事件数 | 写入速率（rate）、按服务/动作拆分、错误率 |
+| `audit_sensitive_hits_total` | **Counter** | `severity` / `matched_rule_id` | 敏感操作命中数 | 敏感事件增长趋势、单条规则命中排行 |
+| `audit_distinct_actor_count` | **Gauge** | （无） | 观察到的独立操作者数量 | 账号活跃度监控、异常突增告警 |
+| `http_request_duration_seconds` | **Histogram** | `method` / `endpoint` / `status_code` | 请求耗时分布 | p50/p95/p99 延迟、写入瓶颈定位 |
+| `http_requests_total` | **Counter** | `method` / `endpoint` / `status_code` | HTTP 请求总数 | QPS、错误率（5xx/总）、端点热度排行 |
+| `http_request_size_bytes` | **Summary** | 同上 | 请求体大小 | 大请求识别、带宽规划 |
+| `http_response_size_bytes` | **Summary** | 同上 | 响应体大小 | 大响应（导出接口）优化 |
+
+#### 10.2.3 三大业务指标详解
+
+##### 🔹 `audit_events_ingested_total`
+
+```promql
+# 近 5 分钟事件写入速率（TPS）
+rate(audit_events_ingested_total[5m])
+
+# 按动作类型拆分（create/read/update/delete/login...）
+sum by (action) (rate(audit_events_ingested_total[5m]))
+
+# 失败率（status=failure 的占比）
+  sum(rate(audit_events_ingested_total{status="failure"}[5m]))
+/ sum(rate(audit_events_ingested_total[5m]))
+```
+
+> 💡 **告警建议**：当失败率 > 5% 持续 2 分钟触发 P2 告警。
+
+##### 🔹 `audit_sensitive_hits_total`
+
+```promql
+# 近 1 小时敏感事件总数
+increase(audit_sensitive_hits_total[1h])
+
+# 按严重级别拆分（critical/high/medium/low）
+sum by (severity) (increase(audit_sensitive_hits_total[1h]))
+
+# 命中最多的 Top 5 敏感规则（用于规则优化）
+topk(5, sum by (matched_rule_id) (rate(audit_sensitive_hits_total[1d])))
+```
+
+> 💡 **告警建议**：`severity="critical"` 事件在 5 分钟内出现 ≥ 3 条 → P1 电话告警。
+
+##### 🔹 `audit_distinct_actor_count`
+
+```promql
+# 独立操作者数 24 小时变化曲线
+audit_distinct_actor_count
+
+# 异常突增检测（1 小时内涨超 2 倍）
+  audit_distinct_actor_count
+/ audit_distinct_actor_count offset 1h
+> 2
+```
+
+> 💡 **启动自动同步**：服务启动时 `bootstrap_actor_count_from_db()` 会扫描已有数据填充初始值，重启后不会归零。
+
+#### 10.2.4 HTTP 基础监控
+
+```promql
+# 核心端点 95 分位延迟（秒）
+histogram_quantile(0.95,
+  sum by (le, endpoint) (rate(http_request_duration_seconds_bucket[5m]))
+)
+
+# 5xx 错误率
+  sum(rate(http_requests_total{status_code=~"5.."}[5m]))
+/ sum(rate(http_requests_total[5m]))
+
+# 事件写入接口 QPS
+sum(rate(http_requests_total{endpoint="/api/v1/events",method="POST"}[1m]))
+```
+
+#### 10.2.5 Prometheus 抓取配置示例
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: audit-trail-api
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["audit-trail-api:8000"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  - job_name: audit-trail-api-slow
+    scrape_interval: 1m
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["audit-trail-api:8000"]
+```
+
+#### 10.2.6 Grafana 推荐面板（可直接 import）
+
+| 面板 | 查询 | 图表类型 |
+|------|------|----------|
+| 写入 TPS | `sum(rate(audit_events_ingested_total[1m]))` | 时间线 |
+| 失败率 | 见上文公式 | 仪表盘（Gauge） |
+| 敏感事件排行 | `topk(10, sum by (matched_rule_id) (rate(audit_sensitive_hits_total[6h])))` | 饼图 / 柱状图 |
+| 延迟分布 | `histogram_quantile(0.99, sum by (le) (rate(...)))` | 热力图 |
+| 操作者增长 | `audit_distinct_actor_count` | 单值 Stat + 趋势 |
+
+---
+
 ## License
 
 内部项目，按需使用。
