@@ -206,6 +206,61 @@ def query_audit_events(
     return events, total, params.page, total_pages
 
 
+def export_audit_events(
+    db: Session,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    actor_id: Optional[str] = None,
+    actor_name: Optional[str] = None,
+    action: Optional[EventAction] = None,
+    status: Optional[EventStatus] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    is_sensitive: Optional[bool] = None,
+    severity: Optional[SeverityLevel] = None,
+    keyword: Optional[str] = None,
+    limit: int = 10000,
+) -> Tuple[List[AuditEvent], int]:
+    query = db.query(AuditEvent)
+    conditions = []
+
+    if start_time:
+        conditions.append(AuditEvent.timestamp >= start_time)
+    if end_time:
+        conditions.append(AuditEvent.timestamp <= end_time)
+    if actor_id:
+        conditions.append(AuditEvent.actor_id == actor_id)
+    if actor_name:
+        conditions.append(AuditEvent.actor_name.ilike(f"%{actor_name}%"))
+    if action:
+        conditions.append(AuditEvent.action == action)
+    if status:
+        conditions.append(AuditEvent.status == status)
+    if resource_type:
+        conditions.append(AuditEvent.resource_type == resource_type)
+    if resource_id:
+        conditions.append(AuditEvent.resource_id == resource_id)
+    if is_sensitive is not None:
+        conditions.append(AuditEvent.is_sensitive == is_sensitive)
+    if severity:
+        conditions.append(AuditEvent.severity == severity)
+    if keyword:
+        kw = f"%{keyword}%"
+        conditions.append(or_(
+            AuditEvent.actor_name.ilike(kw),
+            AuditEvent.action_detail.ilike(kw),
+            AuditEvent.resource_name.ilike(kw),
+            AuditEvent.error_message.ilike(kw),
+        ))
+
+    if conditions:
+        query = query.filter(and_(*conditions))
+
+    total = query.count()
+    events = query.order_by(AuditEvent.timestamp.desc()).limit(limit).all()
+    return events, total
+
+
 def query_by_actor(
     db: Session, actor_id: Optional[str] = None, actor_name: Optional[str] = None,
     start_time: Optional[datetime] = None, end_time: Optional[datetime] = None,

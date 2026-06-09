@@ -10,7 +10,6 @@ import io
 from app.database import get_db
 from app.auth import get_current_user, require_role
 from app.models import User, EventAction, EventStatus, SeverityLevel
-from app.schemas import AuditEventQueryParams
 from app import crud
 
 router = APIRouter(prefix="/export", tags=["Export"])
@@ -33,15 +32,14 @@ def export_csv(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "manager", "auditor")),
 ):
-    params = AuditEventQueryParams(
-        start_time=start_time, end_time=end_time,
+    events, total = crud.export_audit_events(
+        db, start_time=start_time, end_time=end_time,
         actor_id=actor_id, actor_name=actor_name,
         action=action, status=status_enum,
         resource_type=resource_type, resource_id=resource_id,
         is_sensitive=is_sensitive, severity=severity,
-        keyword=keyword, page=1, page_size=limit
+        keyword=keyword, limit=limit
     )
-    events, total, _, _ = crud.query_audit_events(db, params)
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -90,15 +88,14 @@ def export_json(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "manager", "auditor")),
 ):
-    params = AuditEventQueryParams(
-        start_time=start_time, end_time=end_time,
+    events, total = crud.export_audit_events(
+        db, start_time=start_time, end_time=end_time,
         actor_id=actor_id, actor_name=actor_name,
         action=action, status=status_enum,
         resource_type=resource_type, resource_id=resource_id,
         is_sensitive=is_sensitive, severity=severity,
-        keyword=keyword, page=1, page_size=limit
+        keyword=keyword, limit=limit
     )
-    events, total, _, _ = crud.query_audit_events(db, params)
 
     def serialize_event(e):
         return {
